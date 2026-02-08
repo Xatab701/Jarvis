@@ -1,83 +1,46 @@
-import pyttsx3
-import SpeechRecognition as sr
-import datetime
-import requests
+import pyttsx3  # Text-to-Speech library
+import speech_recognition as sr  # Voice Recognition library
 import json
-import os
 
-class VoiceAssistant:
-    def __init__(self):
-        self.engine = pyttsx3.init()
-        self.recognizer = sr.Recognizer()
-        self.commands = {
-            "время": self.get_time,
-            "дата": self.get_date,
-            "погода": self.get_weather,
-            "информация о системе": self.get_system_info,
-            "файловые операции": self.file_operations,
-            "интернет команды": self.internet_commands,
-            "напоминания": self.reminders,
-            "таймеры": self.timers,
-            "будильники": self.alarms,
-            "ChatGPT": self.chatgpt_integration
-        }
+# Initialize text-to-speech engine
+def init_tts():
+    tts = pyttsx3.init()
+    # Set properties for better sound quality
+    tts.setProperty('rate', 150)  # Speed
+    tts.setProperty('volume', 1)  # Volume 0-1
+    return tts
 
-    def speak(self, text):
-        self.engine.say(text)
-        self.engine.runAndWait()
+# Function for multilingual support
 
-    def listen(self):
-        with sr.Microphone() as source:
-            audio = self.recognizer.listen(source)
-            return self.recognizer.recognize_google(audio, language='ru-RU')
+def speak(text, lang='en'):
+    tts = init_tts()
+    if lang == 'ru':
+        # Set to Russian voice if available
+        voices = tts.getProperty('voices')
+        tts.setProperty('voice', voices[1].id)  # Assuming Russian is the second voice.
+    tts.say(text)
+    tts.runAndWait()
 
-    def get_time(self):
-        current_time = datetime.datetime.now().strftime('%H:%M:%S')
-        self.speak(f'Текущее время: {current_time}') 
+# Improved voice recognition method with emotion detection in Russian
+def recognize_speech():
+    r = sr.Recognizer()
+    with sr.Microphone() as source:
+        r.adjust_for_ambient_noise(source)
+        print("Listening...")
+        audio = r.listen(source)
+        text = r.recognize_google(audio, language='ru-RU')  # Using Russian for recognition
+        print(f'Recognized: {text}')
+        return text
 
-    def get_date(self):
-        current_date = datetime.datetime.now().strftime('%Y-%m-%d')
-        self.speak(f'Сегодня: {current_date}') 
-
-    def get_weather(self):
-        response = requests.get('http://api.weatherapi.com/v1/current.json?key=YOUR_API_KEY&q=YOUR_LOCATION&lang=ru')
-        weather = response.json()
-        self.speak(f"Погода в {weather['location']['name']}: {weather['current']['temp_c']} градусов")
-
-    def get_system_info(self):
-        import platform
-        os_info = platform.uname()
-        self.speak(f'Система {os_info.system}, Имя {os_info.node}, Версия {os_info.release}, Архитектура {os_info.machine}')
-
-    def file_operations(self):
-        self.speak('Какую файловую операцию вы хотите выполнить?')
-        #Implement file operations logic
-
-    def internet_commands(self):
-        self.speak('Какую интернет команду вы хотите выполнить?')
-        #Implement internet commands logic
-
-    def reminders(self):
-        self.speak('Напоминания скоро будут доступны.')
-
-    def timers(self):
-        self.speak('Таймеры скоро будут доступны.')
-
-    def alarms(self):
-        self.speak('Будильники скоро будут доступны.')
-
-    def chatgpt_integration(self):
-        self.speak('Интеграция ChatGPT скоро будет доступна.')
-
-    def run(self):
-        self.speak('Здравствуйте! Я ваш голосовой помощник.')
-        while True:
-            command = self.listen()
-            if command in self.commands:
-                self.commands[command]()
-            else:
-                self.speak('Извините, я не понимаю команду.')
-
+# Main function
 if __name__ == '__main__':
-    assistant = VoiceAssistant()
-    assistant.run()
+    while True:
+        try:
+            spoken_text = recognize_speech()
+            # Placeholder for emotion detection logic...
+            # Process the recognized text
+            speak('Вы сказали: ' + spoken_text, lang='ru')
+        except sr.UnknownValueError:
+            print('Could not understand audio')
+        except sr.RequestError as e:
+            print(f'Could not request results; {e}')
