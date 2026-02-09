@@ -57,7 +57,7 @@ class JarvisAssistant:
     def greet_user(self):
         """Приветствие пользователя"""
         name_nominative = self.name_declension.get_form('именительный')
-        greeting = f"Здравствуйте, {name_nominative}! Я ваш голосовой помощник Jarvis. Чем я могу вам помочь?"
+        greeting = f"Привет, {name_nominative}! Я Jarvis. Чем я могу тебе помочь?"
         self.speak(greeting)
     
     def call_user_nominative(self):
