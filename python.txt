@@ -1,0 +1,649 @@
+python
+import os
+import sys
+import json
+import time
+import queue
+import threading
+import subprocess
+from dataclasses import dataclass
+
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("ALL_PROXY", None)
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+os.environ.pop("all_proxy", None)
+
+os.environ["NO_PROXY"] = "*"
+os.environ["no_proxy"] = "*"
+
+from PySide6.QtCore import (
+    Qt,
+    QTimer,
+    QSize,
+    QRect,
+    Signal,
+    QObject,
+    QUrl,
+    QThread,
+    QByteArray,
+)
+from PySide6.QtGui import (
+    QPainter,
+    QColor,
+    QPen,
+    QBrush,
+    QFont,
+    QPixmap,
+    QImage,
+    QLinearGradient,
+    QPalette,
+    QAction,
+    QPainterPath,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QMainWindow,
+    QLabel,
+    QPushButton,
+    QTextEdit,
+    QLineEdit,
+    QCheckBox,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFrame,
+    QSizePolicy,
+    QGridLayout,
+    QScrollArea,
+    QMessageBox,
+    QGraphicsDropShadowEffect,
+    QProgressBar,
+)
+
+import psutil
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+APP_TITLE = "JARVIS HUD"
+MODEL_NAME = "google/gemini-2.5-flash"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+
+THEME_BG = "#090d12"
+THEME_PANEL = "#101822"
+THEME_PANEL_2 = "#0b1118"
+THEME_BORDER = "#1d2a36"
+THEME_TEXT = "#d8f8ff"
+CYAN = "#00f0ff"
+RED = "#ff4b4b"
+GREEN = "#4dff8d"
+AMBER = "#ffcc66"
+
+SYSTEM_PROMPT = """Ты ДЖАРВИС. Лаконичный, преданный, с лёгкой британской иронией.
+Отвечай коротко, без списков и без пунктов.
+"""
+
+MEMORY_PROMPT = """Скрытая база данных:
+BMW E36 седан
+Lagunengrün-Metallic
+госномер Е830ОТ70
+мотор M40B16
+перегрев
+эмульсия
+загнуло клапаны
+момент затяжки ГБЦ по мануалу BMW TIS: 30 Нм, затем два доворота по 90°
+инструмент AnteiKing на 219 предметов
+"""
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+class NeonFrame(QFrame):
+    def __init__(self, parent=None, color=CYAN):
+        super().__init__(parent)
+        self.color = QColor(color)
+        self.setObjectName("NeonFrame")
+        self.setStyleSheet("""
+            QFrame#NeonFrame {
+                background-color: rgba(10, 16, 22, 210);
+                border: 1px solid rgba(0, 240, 255, 80);
+                border-radius: 14px;
+            }
+        """)
+        self.shadow = QGraphicsDropShadowEffect(self)
+        self.shadow.setBlurRadius(28)
+        self.shadow.setOffset(0, 0)
+        self.shadow.setColor(QColor(0, 240, 255, 85))
+        self.setGraphicsEffect(self.shadow)
+
+class GaugeWidget(QWidget):
+    def __init__(self, title, unit, color, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.unit = unit
+        self.color = QColor(color)
+        self.value = 0
+        self.sub = ""
+        self.setMinimumHeight(160)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_value(self, value, sub=""):
+        self.value = int(value)
+        self.sub = sub
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        rect = self.rect().adjusted(12, 12, -12, -12)
+        center = rect.center()
+        radius = min(rect.width(), rect.height()) // 2 - 14
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(12, 18, 24))
+        p.drawRoundedRect(self.rect().adjusted(8, 8, -8, -8), 16, 16)
+
+        bg_pen = QPen(QColor(40, 55, 68), 12)
+        bg_pen.setCapStyle(Qt.RoundCap)
+        p.setPen(bg_pen)
+        p.drawArc(center.x() - radius, center.y() - radius, radius * 2, radius * 2, 45 * 16, -360 * 16)
+
+        span = int(360 * 16 * clamp(self.value / 100.0, 0.0, 1.0))
+        fg_pen = QPen(self.color, 12)
+        fg_pen.setCapStyle(Qt.RoundCap)
+        p.setPen(fg_pen)
+        p.drawArc(center.x() - radius, center.y() - radius, radius * 2, radius * 2, 225 * 16, -span)
+
+        p.setPen(QColor("#e8fbff"))
+        f = QFont("Segoe UI", 10, QFont.DemiBold)
+        p.setFont(f)
+        p.drawText(QRect(0, 14, self.width(), 24), Qt.AlignHCenter | Qt.AlignTop, self.title)
+
+        f2 = QFont("Segoe UI", 24, QFont.Bold)
+        p.setFont(f2)
+        p.setPen(self.color)
+        p.drawText(QRect(0, self.height()//2 - 20, self.width(), 44), Qt.AlignHCenter | Qt.AlignVCenter, f"{self.value}")
+
+        f3 = QFont("Segoe UI", 10)
+        p.setFont(f3)
+        p.setPen(QColor("#97b8c7"))
+        p.drawText(QRect(0, self.height()//2 + 18, self.width(), 26), Qt.AlignHCenter | Qt.AlignTop, self.unit + (f" · {self.sub}" if self.sub else ""))
+
+class ReaktorWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(110, 110)
+        self.pulse = 0.0
+        self.pix = QPixmap()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._animate)
+        self.timer.start(30)
+        self.load_default()
+
+    def load_default(self):
+        self.pix = QPixmap(110, 110)
+        self.pix.fill(Qt.transparent)
+        p = QPainter(self.pix)
+        p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.moveTo(55, 10)
+        path.lineTo(95, 90)
+        path.lineTo(15, 90)
+        path.closeSubpath()
+        grad = QLinearGradient(20, 20, 90, 95)
+        grad.setColorAt(0, QColor("#b5ffff"))
+        grad.setColorAt(0.5, QColor("#00f0ff"))
+        grad.setColorAt(1, QColor("#0a3a55"))
+        p.setPen(QPen(QColor("#66f8ff"), 4))
+        p.setBrush(QBrush(grad))
+        p.drawPath(path)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor("#ff4b4b"), 2))
+        p.drawEllipse(40, 40, 30, 30)
+        p.end()
+
+    def _animate(self):
+        self.pulse += 0.06
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        glow = 70 + int(35 * (0.5 + 0.5 * __import__("math").sin(self.pulse)))
+        p.fillRect(self.rect(), Qt.transparent)
+        p.setBrush(QColor(8, 12, 18, 220))
+        p.setPen(QPen(QColor(0, 240, 255, 90), 1))
+        p.drawRoundedRect(self.rect().adjusted(4, 4, -4, -4), 18, 18)
+
+        shadow = QColor(0, 240, 255, glow)
+        p.setPen(QPen(shadow, 10))
+        p.drawRoundedRect(self.rect().adjusted(8, 8, -8, -8), 16, 16)
+
+        if not self.pix.isNull():
+            img = self.pix.scaled(self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            p.setClipPath(QPainterPath())
+            p.drawPixmap(0, 0, img)
+
+    def set_image(self, img: QImage):
+        self.pix = QPixmap.fromImage(img).scaled(self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        self.update()
+
+class CameraWorker(QObject):
+    frameReady = Signal(QImage)
+    error = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.capture_once = False
+        self.running = True
+
+    def request_capture(self):
+        self.capture_once = True
+
+    def stop(self):
+        self.running = False
+
+    def run(self):
+        if cv2 is None:
+            self.error.emit("OpenCV unavailable")
+            return
+
+        cap = None
+        try:
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                self.error.emit("Camera open failed")
+                return
+
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            last = time.time()
+            while self.running:
+                ok, frame = cap.read()
+                if ok:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w, ch = frame.shape
+                    img = QImage(frame.data, w, h, ch * w, QImage.Format_RGB888).copy()
+                    if self.capture_once:
+                        self.frameReady.emit(img)
+                        self.capture_once = False
+                else:
+                    if time.time() - last > 3:
+                        self.error.emit("Camera frame read failed")
+                        last = time.time()
+                time.sleep(0.03)
+        except Exception as ex:
+            self.error.emit(str(ex))
+        finally:
+            if cap is not None:
+                cap.release()
+
+class OpenRouterWorker(QObject):
+    responseReady = Signal(str)
+    error = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._q = queue.Queue()
+        self._running = True
+
+    def ask(self, text, history):
+        self._q.put((text, history))
+
+    def stop(self):
+        self._running = False
+        self._q.put(None)
+
+    def run(self):
+        if requests is None:
+            self.error.emit("requests unavailable")
+            return
+        sess = requests.Session()
+        sess.trust_env = False
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost",
+            "X-Title": "JARVIS HUD",
+        }
+        while self._running:
+            item = self._q.get()
+            if item is None:
+                continue
+            text, history = item
+            try:
+                messages = [{"role": "system", "content": SYSTEM_PROMPT + "\n" + MEMORY_PROMPT}]
+                for role, content in history[-12:]:
+                    messages.append({"role": role, "content": content})
+                messages.append({"role": "user", "content": text})
+
+                payload = {
+                    "model": MODEL_NAME,
+                    "messages": messages,
+                    "temperature": 0.4,
+                }
+                resp = sess.post(
+                    OPENROUTER_URL,
+                    headers=headers,
+                    data=json.dumps(payload),
+                    timeout=None,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                self.responseReady.emit(content.strip())
+            except Exception as ex:
+                self.error.emit(str(ex))
+
+class MainWindow(QMainWindow):
+    askSignal = Signal(str)
+    captureSignal = Signal()
+    stopAll = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.setMinimumSize(1400, 860)
+        self.setStyleSheet(f"""
+            QWidget {{
+                background-color: {THEME_BG};
+                color: {THEME_TEXT};
+                font-family: Segoe UI;
+            }}
+            QTextEdit, QLineEdit {{
+                background-color: rgba(8, 14, 20, 220);
+                border: 1px solid rgba(0, 240, 255, 70);
+                border-radius: 10px;
+                padding: 10px;
+                color: #e8fbff;
+                selection-background-color: rgba(0, 240, 255, 120);
+            }}
+            QPushButton {{
+                background-color: rgba(0, 240, 255, 20);
+                border: 1px solid rgba(0, 240, 255, 120);
+                border-radius: 10px;
+                padding: 10px 14px;
+                color: #dffcff;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(0, 240, 255, 35);
+            }}
+            QCheckBox {{
+                spacing: 10px;
+                color: #dffcff;
+                font-size: 13px;
+            }}
+            QCheckBox::indicator {{
+                width: 18px;
+                height: 18px;
+                border-radius: 5px;
+                border: 1px solid rgba(0, 240, 255, 120);
+                background: rgba(8, 14, 20, 200);
+            }}
+            QCheckBox::indicator:checked {{
+                background: rgba(0, 240, 255, 180);
+                border: 1px solid rgba(0, 240, 255, 220);
+            }}
+        """)
+        self.history = []
+        self._build_ui()
+        self._build_workers()
+        self._build_timers()
+
+    def _build_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        main = QHBoxLayout(root)
+        main.setContentsMargins(14, 14, 14, 14)
+        main.setSpacing(14)
+
+        self.left_panel = NeonFrame(color=CYAN)
+        self.center_panel = NeonFrame(color=CYAN)
+        self.right_panel = NeonFrame(color=RED)
+
+        left_layout = QVBoxLayout(self.left_panel)
+        center_layout = QVBoxLayout(self.center_panel)
+        right_layout = QVBoxLayout(self.right_panel)
+
+        title_l = QLabel("📊 SYSTEM STATUS")
+        title_l.setStyleSheet("font-size: 18px; font-weight: 700; color: #dffcff;")
+        left_layout.addWidget(title_l)
+
+        self.cpu_gauge = GaugeWidget("CPU LOAD", "%", CYAN)
+        self.gpu_gauge = GaugeWidget("RTX 2060S TEMP", "°C", RED)
+        left_layout.addWidget(self.cpu_gauge)
+        left_layout.addWidget(self.gpu_gauge)
+        left_layout.addStretch(1)
+
+        title_c = QLabel("💬 TACTICAL CHAT")
+        title_c.setStyleSheet("font-size: 18px; font-weight: 700; color: #dffcff;")
+        center_layout.addWidget(title_c)
+
+        self.chat_history = QTextEdit()
+        self.chat_history.setReadOnly(True)
+        self.chat_history.setMinimumHeight(500)
+        self.chat_history.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        center_layout.addWidget(self.chat_history, 1)
+
+        input_row = QHBoxLayout()
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("Введите команду...")
+        self.send_btn = QPushButton("SEND")
+        self.send_btn.clicked.connect(self.send_chat)
+        self.chat_input.returnPressed.connect(self.send_chat)
+        input_row.addWidget(self.chat_input, 1)
+        input_row.addWidget(self.send_btn)
+        center_layout.addLayout(input_row)
+
+        title_r = QLabel("👁️ OPTICAL STREAM & TASKS")
+        title_r.setStyleSheet("font-size: 18px; font-weight: 700; color: #dffcff;")
+        right_layout.addWidget(title_r)
+
+        self.camera_preview = QLabel("CAM FEED")
+        self.camera_preview.setFixedHeight(260)
+        self.camera_preview.setAlignment(Qt.AlignCenter)
+        self.camera_preview.setStyleSheet("""
+            QLabel {
+                background-color: rgba(8, 14, 20, 220);
+                border: 1px solid rgba(255, 75, 75, 90);
+                border-radius: 12px;
+                color: #92a8b8;
+            }
+        """)
+        right_layout.addWidget(self.camera_preview)
+
+        self.capture_btn = QPushButton("📸 ФИКСАЦИЯ КАДРА")
+        self.capture_btn.clicked.connect(self.capture_frame)
+        right_layout.addWidget(self.capture_btn)
+
+        m40_title = QLabel("📋 МАРШРУТНЫЙ ЛИСТ M40")
+        m40_title.setStyleSheet("font-size: 15px; font-weight: 700; color: #ffd4d4; margin-top: 6px;")
+        right_layout.addWidget(m40_title)
+
+        self.checks = []
+        checklist = QVBoxLayout()
+        steps = [
+            "Проверить ГБЦ и плоскость",
+            "Проверить эмульсию и масло",
+            "Проверить компрессию",
+            "Проверить клапаны и ГРМ",
+            "Собрать и затянуть по TIS",
+        ]
+        for s in steps:
+            cb = QCheckBox(s)
+            self.checks.append(cb)
+            checklist.addWidget(cb)
+        checklist.addStretch(1)
+        right_layout.addLayout(checklist)
+        right_layout.addStretch(1)
+
+        main.addWidget(self.left_panel, 3)
+        main.addWidget(self.center_panel, 4)
+        main.addWidget(self.right_panel, 3)
+
+        self.reactor = ReaktorWidget(self)
+        self.reactor.setObjectName("reactor")
+        self.reactor.setStyleSheet("background: transparent;")
+        self.reactor.show()
+
+        self.reactor_timer = QTimer(self)
+        self.reactor_timer.timeout.connect(self._position_reactor)
+        self.reactor_timer.start(50)
+
+        self.statusBar().hide()
+
+    def _position_reactor(self):
+        geo = self.geometry()
+        margin = 18
+        x = geo.x() + geo.width() - self.reactor.width() - margin
+        y = geo.y() + margin
+        self.reactor.move(x, y)
+        self.reactor.raise_()
+
+    def _build_workers(self):
+        self.cam_thread = QThread(self)
+        self.cam_worker = CameraWorker()
+        self.cam_worker.moveToThread(self.cam_thread)
+        self.cam_thread.started.connect(self.cam_worker.run)
+        self.cam_worker.frameReady.connect(self.on_camera_frame)
+        self.cam_worker.error.connect(self.on_worker_error)
+        self.captureSignal.connect(self.cam_worker.request_capture)
+        self.cam_thread.start()
+
+        self.ai_thread = QThread(self)
+        self.ai_worker = OpenRouterWorker()
+        self.ai_worker.moveToThread(self.ai_thread)
+        self.ai_thread.started.connect(self.ai_worker.run)
+        self.ai_worker.responseReady.connect(self.on_ai_response)
+        self.ai_worker.error.connect(self.on_worker_error)
+        self.askSignal.connect(self.ai_worker.ask)
+        self.ai_thread.start()
+
+    def _build_timers(self):
+        self.system_timer = QTimer(self)
+        self.system_timer.timeout.connect(self.refresh_system)
+        self.system_timer.start(1000)
+
+    def refresh_system(self):
+        cpu = int(psutil.cpu_percent(interval=None))
+        gpu_temp = self.get_gpu_temp()
+        if gpu_temp is None:
+            gpu_temp = 0
+        self.cpu_gauge.set_value(cpu, "dynamic")
+        self.gpu_gauge.set_value(clamp(gpu_temp, 0, 100), "sensor")
+
+    def get_gpu_temp(self):
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+            vals = [int(x.strip()) for x in out.splitlines() if x.strip().isdigit()]
+            return vals[0] if vals else None
+        except Exception:
+            return None
+
+    def capture_frame(self):
+        self.captureSignal.emit()
+
+    def on_camera_frame(self, img):
+        scaled = img.scaled(self.camera_preview.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        self.camera_preview.setPixmap(QPixmap.fromImage(scaled))
+
+    def on_worker_error(self, msg):
+        self.append_chat_system(f"ERR: {msg}")
+
+    def append_chat_user(self, text):
+        self.chat_history.append(f"<span style='color:#7befff'><b>YOU:</b></span> {self.escape(text)}")
+        self.scroll_chat_bottom()
+
+    def append_chat_assistant(self, text):
+        self.chat_history.append(f"<span style='color:#ffb8b8'><b>JARVIS:</b></span> {self.escape(text)}")
+        self.scroll_chat_bottom()
+
+    def append_chat_system(self, text):
+        self.chat_history.append(f"<span style='color:#ffcc66'><b>SYSTEM:</b></span> {self.escape(text)}")
+        self.scroll_chat_bottom()
+
+    def escape(self, text):
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
+
+    def scroll_chat_bottom(self):
+        sb = self.chat_history.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def send_chat(self):
+        text = self.chat_input.text().strip()
+        if not text:
+            return
+        self.chat_input.clear()
+        self.append_chat_user(text)
+        self.history.append(("user", text))
+        if not OPENROUTER_KEY:
+            self.append_chat_system("OpenRouter key missing.")
+            return
+        self.askSignal.emit(text)
+
+    def on_ai_response(self, text):
+        self.history.append(("assistant", text))
+        self.append_chat_assistant(text)
+
+    def closeEvent(self, e):
+        try:
+            self.cam_worker.stop()
+            self.ai_worker.stop()
+            self.cam_thread.quit()
+            self.cam_thread.wait(1500)
+            self.ai_thread.quit()
+            self.ai_thread.wait(1500)
+        except Exception:
+            pass
+        e.accept()
+
+def main():
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_TITLE)
+    app.setOrganizationName("JARVIS")
+    app.setStyle("Fusion")
+
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(THEME_BG))
+    palette.setColor(QPalette.WindowText, QColor(THEME_TEXT))
+    palette.setColor(QPalette.Base, QColor(THEME_PANEL_2))
+    palette.setColor(QPalette.AlternateBase, QColor(THEME_PANEL))
+    palette.setColor(QPalette.Text, QColor(THEME_TEXT))
+    palette.setColor(QPalette.Button, QColor(THEME_PANEL))
+    palette.setColor(QPalette.ButtonText, QColor(THEME_TEXT))
+    palette.setColor(QPalette.Highlight, QColor(CYAN))
+    palette.setColor(QPalette.HighlightedText, QColor("#000000"))
+    app.setPalette(palette)
+
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
